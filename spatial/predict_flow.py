@@ -6,9 +6,12 @@ from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
 import torch.optim as optim
 from lora_pytorch import LoRA
+from attn_lora import MHAttenLoRA
 from itertools import cycle
 from pretrained_model import HistFlowRNA, ConditionalFlowNet, load_pretrained_model
-from dataset import SpatialDataset
+from dataset import ProteinExpressionDataset
+import os
+from tqdm import tqdm
 
 from scgpt.model import TransformerModel
 from scgpt.utils import load_pretrained
@@ -64,13 +67,12 @@ def integrate_flow(flow_model, z_init, steps=60, cond_vec=None):
 
 
 class ImageToProteinModel(nn.Module):
-    def __init__(self, path_model_visual, rna_model, protein_model, rna_flow, spot_dim, protein_dim, num_proteins, protein_names=None):
+    def __init__(self, hist_flow_rna, rna_flow, spot_dim, protein_dim, num_proteins, protein_names=None):
         super(ImageToProteinModel, self).__init__()
-        self.path_model_visual = path_model_visual
-        self.rna_model = rna_model
-        self.protein_model = protein_model
+        self.hist_flow_rna = hist_flow_rna
         self.rna_flow = rna_flow
         self.num_proteins = num_proteins
+        self.image_ln = nn.LayerNorm(spot_dim)
 
         self.protein_projection = nn.Linear(protein_dim, spot_dim)  # protein_emb -> spot_dim
         self.trans_dim = nn.Linear(spot_dim * 4, spot_dim)  # hist + rna + prot + protein_proj
@@ -82,42 +84,32 @@ class ImageToProteinModel(nn.Module):
                 nn.Linear(spot_dim // 2, 1)
             ) for _ in range(num_proteins)
         ])
+
         if protein_names is not None:
             for i, name in enumerate(protein_names):
                 self.prediction_layers_expression[i].name = name
 
-    def forward(self, image, input_gene_ids, expressions, src_key_padding_mask, 
-        protein_emb, enrichment, steps=60):
+    def forward(self, image, protein_emb, hist_features, hist_celltype_prob,
+                pred_rna_emb, pred_prot_emb, steps=60):
 
-        device = image.device
+        # === 1. Dynamic: image_latent via trainable hist_model (with LoRA) ===
+        image_latent, _ = self.hist_flow_rna.hist_model(image)
 
-        image_latent, _ = accelerator.unwrap_model(self.path_model_visual)(image)
+        # === 2. Static: normalize cached features (no trainable affine params) ===
+        image_latent = self.image_ln(image_latent)
+        pred_rna_emb = F.layer_norm(pred_rna_emb, (pred_rna_emb.size(-1),))
+        pred_prot_emb_norm = F.layer_norm(pred_prot_emb, (pred_prot_emb.size(-1),))
 
-        cell_embeddings = accelerator.unwrap_model(self.rna_model)._encode(
-            input_gene_ids,
-            expressions,
-            src_key_padding_mask=src_key_padding_mask,
-            batch_labels=None
-        )
-        cell_embeddings = cell_embeddings[:, 0, :]
-
-        # === 2. RNA embedding -> Protein embedding (cond_vec = one-hot sample_group) ===
-        cond_vec = enrichment
-
-        try:
-            pred_prot_emb = integrate_flow(self.rna_flow, cell_embeddings, steps=steps, cond_vec=cond_vec)
-        except:
-            print(cell_embeddings.shape, cond_vec.shape)
-
-        # === 3. integration ===
-        spot_embeddings = torch.cat((image_latent, cell_embeddings, pred_prot_emb), dim=-1)  # [B, spot_dim*3]
-
+        # === 3. Integration ===
+        spot_embeddings = torch.cat(
+            (image_latent, pred_rna_emb, pred_prot_emb_norm), dim=-1
+        )  # [B, spot_dim*3]
         protein_projected = self.protein_projection(protein_emb)  # [B, num_proteins, spot_dim]
         spot_embeddings = spot_embeddings.unsqueeze(1).repeat(1, self.num_proteins, 1)
         x = torch.cat((protein_projected, spot_embeddings), dim=-1)  # [B, num_proteins, spot_dim*4]
         x = self.trans_dim(x)  # [B, num_proteins, spot_dim]
 
-        # === 4. prediction ===
+        # === 4. Prediction ===
         expr_preds = []
         for i in range(self.num_proteins):
             pred = self.prediction_layers_expression[i](x[:, i, :])  # (B, 1)
@@ -125,7 +117,6 @@ class ImageToProteinModel(nn.Module):
         expr_preds = torch.cat(expr_preds, dim=1)  # (B, num_proteins)
 
         return pred_prot_emb, expr_preds
-    
 
 
 class RBF(nn.Module):
@@ -218,12 +209,10 @@ class ZILNLoss(nn.Module):
         Returns:
             loss (torch.Tensor): Loss value
         """
+        # 1. Construct the ground truth for expression status (0/1)
+        target_presence = (target_expression > 0).float()
+
         regression_loss = F.mse_loss(predicted_expression_values, target_expression)
-
-        # # 1. Construct the ground truth for expression status (0/1)
-        # target_presence = (target_expression > 0).float()
-
-        # # regression_loss = F.mse_loss(predicted_expression_values, target_expression)
         # weights = torch.where(target_expression <= 0.5, torch.tensor(3.0), torch.tensor(1.0))
         # regression_loss = torch.mean(weights * F.mse_loss(predicted_expression_values, target_expression, reduction="none"))
 
@@ -242,6 +231,41 @@ def calculate_accuracy(predictions, targets, threshold=0):
     )
     return np.mean(gene_accuracies), np.max(gene_accuracies), np.min(gene_accuracies)
 
+
+# def calculate_correlations(predictions, targets):
+
+#     if not isinstance(predictions, np.ndarray):
+#         predictions = predictions.cpu().numpy()
+#     if not isinstance(targets, np.ndarray):
+#         targets = targets.cpu().numpy()
+
+#     num_proteins = predictions.shape[1]
+#     correlations = []
+
+#     for j in range(num_proteins):
+#         pred_j = predictions[:, j]
+#         target_j = targets[:, j]
+
+#         mask = target_j != 0
+#         if mask.sum() < 2:
+#             correlations.append((0.0, 0.0))
+#             continue
+
+#         pred_valid = pred_j[mask]
+#         target_valid = target_j[mask]
+
+#         try:
+#             pearson_corr, _ = pearsonr(pred_valid, target_valid)
+#         except Exception:
+#             pearson_corr = 0.0
+#         try:
+#             spearman_corr, _ = spearmanr(pred_valid, target_valid)
+#         except Exception:
+#             spearman_corr = 0.0
+
+#         correlations.append((pearson_corr, spearman_corr))
+
+#     return correlations
 
 def calculate_correlations(predictions, targets):
     """Calculates Pearson and Spearman correlations for each gene.
@@ -265,6 +289,32 @@ def calculate_correlations(predictions, targets):
     return correlations
 
 
+def calculate_metrics(preds, targets):
+    """
+    preds/targets: (N, Num_Proteins) torch tensors
+    Returns: (mean_pcc, mean_scc, list_pcc, list_scc)
+    """
+    preds = preds.detach().cpu().numpy()
+    targets = targets.detach().cpu().numpy()
+
+    num_proteins = preds.shape[1]
+    pccs = []
+    sccs = []
+
+    for i in range(num_proteins):
+        p = preds[:, i]
+        t = targets[:, i]
+        if np.std(p) < 1e-6 or np.std(t) < 1e-6:
+            pcc, scc = 0.0, 0.0
+        else:
+            pcc, _ = pearsonr(p, t)
+            scc, _ = spearmanr(p, t)
+        pccs.append(pcc)
+        sccs.append(scc)
+
+    return np.mean(pccs), np.mean(sccs), pccs, sccs
+
+
 def train_and_evaluate(model, protein_model, train_loader, test_loader, optimizer, scheduler, train_protein, num_epochs=20):
     """
     Trains and evaluates the AttentionFusionModel using Accelerate.
@@ -281,6 +331,7 @@ def train_and_evaluate(model, protein_model, train_loader, test_loader, optimize
     # # Initialize Accelerator
     # accelerator = Accelerator(mixed_precision="bf16")
 
+    # Define loss function and optimizer
     rbf_kernel = RBF(bandwidth=1.0, learnable_bandwidth=True)
     mmd_loss_fn = MMDLoss(rbf_kernel)
     criterion = ZILNLoss(mmd_weight=1)
@@ -296,7 +347,18 @@ def train_and_evaluate(model, protein_model, train_loader, test_loader, optimize
         all_train_targets = []
 
         # Training loop
-        for batch_idx, (image, input_gene_ids, expressions, src_key_padding_mask, input_protein_ids, protein_expressions, src_key_padding_mask_protein, protein_expression_ori, protein_emb, enrichment, indices) in enumerate(train_loader):
+        for batch_idx, (
+            image,
+            protein_exp,
+            protein_emb,
+            input_protein_ids,
+            protein_expressions,
+            src_key_padding_mask_protein,
+            hist_features,
+            hist_celltype_prob,
+            pred_rna_emb,
+            pred_prot_emb,
+        ) in enumerate(train_loader):
 
             optimizer.zero_grad()  # Zero the gradients
             protein_cell_embeddings = accelerator.unwrap_model(protein_model)._encode(
@@ -308,27 +370,32 @@ def train_and_evaluate(model, protein_model, train_loader, test_loader, optimize
             protein_cell_embeddings = protein_cell_embeddings[:, 0, :]
 
             with accelerator.autocast():
-                pred_prot_emb, expression_predictions = model(image, input_gene_ids, expressions, src_key_padding_mask, protein_emb, enrichment)  # Forward pass
-                loss_final = cosine_similarity_loss(pred_prot_emb, protein_cell_embeddings) + mmd_loss_fn(pred_prot_emb, protein_cell_embeddings)
-                loss_pred, regression_loss, mmd_loss = criterion(expression_predictions, protein_expression_ori)  # Calculate the loss
+                pred_prot_emb_out, expression_predictions = model(
+                    image,
+                    protein_emb,
+                    hist_features,
+                    hist_celltype_prob,
+                    pred_rna_emb,
+                    pred_prot_emb,
+                )  # Forward pass
+                loss_pred, regression_loss, mmd_loss = criterion(expression_predictions, protein_exp)  # Calculate the loss
 
-            loss = loss_final + loss_pred
+            # loss_final is a monitoring metric only (pred_prot_emb is static/cached)
+            with torch.no_grad():
+                flow_metric = cosine_similarity_loss(pred_prot_emb_out, protein_cell_embeddings)
+
+            loss = loss_pred
             accelerator.backward(loss)  # Backpropagation
             optimizer.step()  # Update the weights
-
-            # if epoch < num_epochs // 2:
-            #     pass  
-            # else:
-            #     scheduler.step()
 
             train_loss += loss.item()
             train_reg_loss += regression_loss.item()
             train_mmd_loss += mmd_loss.item()
-            train_flow_loss += loss_final.item()
+            train_flow_loss += flow_metric.item()
 
             # expression_predictions[expression_predictions < 0] = 0
             all_train_predictions.append(expression_predictions.detach())
-            all_train_targets.append(protein_expression_ori.detach())
+            all_train_targets.append(protein_exp.detach())
 
         avg_train_loss = train_loss / len(train_loader)
         avg_train_flow_loss = train_flow_loss / len(train_loader)
@@ -360,8 +427,7 @@ def train_and_evaluate(model, protein_model, train_loader, test_loader, optimize
 
 
         if accelerator.is_main_process:
-            print(f"Epoch {epoch+1}/{num_epochs}, Training Loss: {avg_train_loss:.4f}, Training Flow Loss: {avg_train_flow_loss:.4f}, "
-                  f"Training Regression Loss: {avg_train_reg_loss:.4f}, Training MMD Loss: {avg_train_mmd_loss:.4f}, "
+            print(f"Epoch {epoch+1}/{num_epochs}, Training Loss: {avg_train_loss:.4f}, Training Flow Loss: {avg_train_flow_loss:.4f}, Training Regression Loss: {avg_train_reg_loss:.4f}, Training MMD Loss: {avg_train_mmd_loss:.4f}, "
                   f"Avg Train Pearson Correlation: {avg_train_pearson:.4f}, "
                   f"Avg Train Spearman Correlation: {avg_train_spearman:.4f}, "
                   f"Max Train Pearson Correlation: {max_train_pearson:.4f}, "
@@ -372,61 +438,119 @@ def train_and_evaluate(model, protein_model, train_loader, test_loader, optimize
         # Evaluation every 5 epochs
         if (epoch + 1) % 5 == 0:
             model.eval()  # Set the model to evaluation mode
-            results = []  
-            with torch.no_grad():  # Disable gradient calculation during evaluation
-                test_loss = 0.0
-                all_test_predictions = []
-                all_test_targets = []
-                all_indices = []
-                for image, input_gene_ids, expressions, src_key_padding_mask, input_protein_ids, protein_expressions, src_key_padding_mask_protein, protein_expression_ori, protein_emb, enrichment, indices in test_loader:
-                    with accelerator.autocast():
-                        pred_prot_emb, expression_predictions = model(image, input_gene_ids, expressions, src_key_padding_mask, protein_emb, enrichment)  # Forward pass
-                        # protein_expression_ori = protein_expression_ori.to(expression_predictions.device)
-                        # print(protein_exp.device)
-                        loss, regression_loss, mmd_loss = criterion(expression_predictions, protein_expression_ori)  # Loss计算
-                    test_loss += loss.item()
-                    # expression_predictions[expression_predictions < 0] = 0
-                    all_test_predictions.append(expression_predictions.detach())
-                    all_test_targets.append(protein_expression_ori.detach())
-                    all_indices.append(indices.detach())
+            results = []
+            epoch_avg_pearsons = []
+            epoch_avg_spearmans = []
+            all_samples_list_pcc = []
+            all_samples_list_scc = []
 
-                all_test_predictions = torch.cat(all_test_predictions, dim=0)
-                all_test_targets = torch.cat(all_test_targets, dim=0)
-                all_indices = torch.cat(all_indices, dim=0)
-                # Gather metrics across devices if using distributed training
-                all_test_predictions = accelerator.gather_for_metrics(all_test_predictions)
-                all_test_targets = accelerator.gather_for_metrics(all_test_targets)
-                all_indices = accelerator.gather_for_metrics(all_indices)
-                accelerator.print(all_test_predictions.shape)
-                test_correlations = calculate_correlations(all_test_predictions, all_test_targets)
-                test_pearson_corrs, test_spearman_corrs = zip(*test_correlations)
-                avg_test_pearson = np.mean(test_pearson_corrs)
-                avg_test_spearman = np.mean(test_spearman_corrs)
-                max_test_pearson = np.max(test_pearson_corrs)
-                min_test_pearson = np.min(test_pearson_corrs)
-                max_test_spearman = np.max(test_spearman_corrs)
-                min_test_spearman = np.min(test_spearman_corrs)
-                results.append({
-                    'epoch': epoch + 1,
-                    'avg_pearson_corr': avg_test_pearson,
-                    'max_pearson_corr': max_test_pearson,
-                    'min_pearson_corr': min_test_pearson,
-                    'avg_spearman_corr': avg_test_spearman,
-                    'max_spearman_corr': max_test_spearman,
-                    'min_spearman_corr': min_test_spearman
-                })
+            with torch.no_grad():  # Disable gradient calculation during evaluation
+                for sample_name, dataloader in test_loader.items():
+                    test_loss = 0.0
+                    all_test_predictions = []
+                    all_test_targets = []
+                    for (
+                        image,
+                        protein_exp,
+                        protein_emb,
+                        input_protein_ids,
+                        protein_expressions,
+                        src_key_padding_mask_protein,
+                        hist_features,
+                        hist_celltype_prob,
+                        pred_rna_emb,
+                        pred_prot_emb,
+                    ) in dataloader:
+                        with accelerator.autocast():
+                            pred_prot_emb_out, expression_predictions = model(
+                                image,
+                                protein_emb,
+                                hist_features,
+                                hist_celltype_prob,
+                                pred_rna_emb,
+                                pred_prot_emb,
+                            )  # Forward pass
+                            protein_exp = protein_exp.to(expression_predictions.device)
+                            loss, regression_loss, mmd_loss = criterion(expression_predictions, protein_exp)  # Loss计算
+                        test_loss += loss.item()
+                        all_test_predictions.append(expression_predictions.detach())
+                        all_test_targets.append(protein_exp.detach())
+                    all_test_predictions = torch.cat(all_test_predictions, dim=0)
+                    all_test_targets = torch.cat(all_test_targets, dim=0)
+                    # Gather metrics across devices if using distributed training
+                    all_test_predictions = accelerator.gather_for_metrics(all_test_predictions)
+                    all_test_targets = accelerator.gather_for_metrics(all_test_targets)
+
+                    mean_pcc, mean_scc, list_pcc, list_scc = calculate_metrics(all_test_predictions, all_test_targets)
+                    epoch_avg_pearsons.append(mean_pcc)
+                    epoch_avg_spearmans.append(mean_scc)
+                    results.append({
+                        'sample_name': sample_name,
+                        'avg_pearson': mean_pcc,
+                        'max_pearson': np.max(list_pcc),
+                        'min_pearson': np.min(list_pcc),
+                        'avg_spearman': mean_scc,
+                        'max_spearman': np.max(list_scc),
+                        'min_spearman': np.min(list_scc)
+                    })
+                    all_samples_list_pcc.append(np.array(list_pcc, dtype=np.float32))
+                    all_samples_list_scc.append(np.array(list_scc, dtype=np.float32))
+
+                    if (epoch + 1) == num_epochs and accelerator.is_main_process:
+                        save_dir = 'result/corr'
+                        df_corr = pd.DataFrame({
+                            'Pearson': list_pcc,
+                            'Spearman': list_scc
+                        }, index=train_protein)
+
+                        csv_path = os.path.join(save_dir, f"{sample_name}.csv")
+                        df_corr.to_csv(csv_path)
+                        if sample_name == '19510_P37-S83_C40_US_SCAN_OR_001':
+                            all_test_predictions = pd.DataFrame(all_test_predictions.cpu().numpy())
+                            all_test_targets = pd.DataFrame(all_test_targets.cpu().numpy())
+                            all_test_predictions.to_csv(os.path.join("result", f"{sample_name}_pred.csv"))
+                            all_test_targets.to_csv(os.path.join("result", f"{sample_name}_target.csv"))
+
             if accelerator.is_main_process:
-                for result in results:
-                    print(f"Epoch {result['epoch']} | "
-                        f"Avg Pearson: {result['avg_pearson_corr']:.4f}, Max Pearson: {result['max_pearson_corr']:.4f}, "
-                        f"Min Pearson: {result['min_pearson_corr']:.4f}, Avg Spearman: {result['avg_spearman_corr']:.4f}, "
-                        f"Max Spearman: {result['max_spearman_corr']:.4f}, Min Spearman: {result['min_spearman_corr']:.4f}")
-                if epoch + 1 == num_epochs:
-                    all_test_predictions = pd.DataFrame(all_test_predictions.cpu().numpy(), columns=train_protein)
-                    all_test_targets = pd.DataFrame(all_test_targets.cpu().numpy(), columns=train_protein)
-                    all_test_predictions.to_csv(f'result/test_prediction_80_lr_scale.csv')
-                    all_test_targets.to_csv(f'result/test_target_80_lr_scale.csv')
-                    torch.save(all_indices, 'result/all_indices_scale.pkl')
+                print(f"\n" + "="*30 + f" Epoch {epoch+1} Test Summary " + "="*30)
+
+                global_avg_p = np.mean(epoch_avg_pearsons)
+                global_max_p = np.max(epoch_avg_pearsons)
+                global_min_p = np.min(epoch_avg_pearsons)
+
+                global_avg_s = np.mean(epoch_avg_spearmans)
+                global_max_s = np.max(epoch_avg_spearmans)
+                global_min_s = np.min(epoch_avg_spearmans)
+
+                print(f"[GLOBAL ALL SAMPLES]")
+                print(f"Pearson  -> Global Avg: {global_avg_p:.4f} | Best Sample Avg: {global_max_p:.4f} | Worst Sample Avg: {global_min_p:.4f}")
+                print(f"Spearman -> Global Avg: {global_avg_s:.4f} | Best Sample Avg: {global_max_s:.4f} | Worst Sample Avg: {global_min_s:.4f}")
+                print("-" * 20)
+
+                print(f"{'Sample Name':<25} | {'Avg Pearson':<12} | {'Max Pearson':<12} | {'Min Pearson':<12} | {'Avg Spearman':<12}")
+                print("-" * 20)
+                for r in results:
+                    print(f"{r['sample_name']:<25} | {r['avg_pearson']:<12.4f} | {r['max_pearson']:<12.4f} | {r['min_pearson']:<12.4f} | {r['avg_spearman']:<12.4f}")
+
+                # ===== Per-protein PCC across all test samples =====
+                all_samples_list_pcc = np.stack(all_samples_list_pcc, axis=0)  # (num_samples, num_proteins)
+
+                # Mean Pearson per protein across all test samples
+                protein_mean_pcc = np.mean(all_samples_list_pcc, axis=0)       # (num_proteins,)
+
+                # Stats over protein dimension
+                protein_mean_pcc_avg = float(np.mean(protein_mean_pcc))
+                protein_mean_pcc_median = float(np.median(protein_mean_pcc))
+
+                print("\n[Per-protein PCC across all test samples]")
+                print(f"Protein-wise mean PCC -> Mean over proteins: {protein_mean_pcc_avg:.4f}, Median over proteins: {protein_mean_pcc_median:.4f}")
+
+                # Print per-protein PCC using train_protein names
+                print("\nProtein\t\tMean_PCC(over samples)")
+                for i, pname in enumerate(train_protein):
+                    print(f"{pname}\t\t{protein_mean_pcc[i]:.4f}")
+
+                print("="*20 + "\n")
 
 
 def build_scgpt_model():
@@ -476,45 +600,223 @@ def freeze_model_parameters(model):
     param.requires_grad = False
 
 
+class LoRALinear(nn.Module):
+    """LoRA adapter for nn.Linear layers: h = Wx + (alpha/r) * B A x.
+
+    Freezes the original weight W and only trains low-rank matrices A and B,
+    dramatically reducing trainable parameters.
+    """
+    def __init__(self, linear: nn.Linear, rank: int = 8, alpha: float = 16.0,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.rank = rank
+        self.scaling = alpha / rank
+
+        # Original frozen linear layer
+        self.linear = linear
+        self.linear.weight.requires_grad = False
+        if self.linear.bias is not None:
+            self.linear.bias.requires_grad = False
+
+        out_features, in_features = linear.weight.shape
+        # LoRA low-rank matrices
+        self.lora_A = nn.Parameter(torch.empty(rank, in_features))
+        self.lora_B = nn.Parameter(torch.empty(out_features, rank))
+
+        # Initialization: Kaiming uniform for A, zeros for B (so delta = 0 at start)
+        nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
+        nn.init.zeros_(self.lora_B)
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x):
+        lora_update = self.dropout(x) @ self.lora_A.T @ self.lora_B.T
+        return self.linear(x) + lora_update * self.scaling
+
+
+def apply_lora_to_linear_children(module: nn.Module, rank: int = 8,
+                                   alpha: float = 16.0, dropout: float = 0.0):
+    """Recursively replace all nn.Linear children of `module` with LoRALinear."""
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            setattr(module, name, LoRALinear(child, rank=rank, alpha=alpha,
+                                              dropout=dropout))
+        else:
+            apply_lora_to_linear_children(child, rank=rank, alpha=alpha,
+                                           dropout=dropout)
+
+
+def enable_hist_model_lora(hist_model, lora_rank=8, lora_alpha=16.0, lora_dropout=0.0):
+    """Enable LoRA fine-tuning on the last 2 ViT blocks of hist_model.
+
+    Follows pred_imgonly_new.py lines 660-683:
+      - Freeze entire hist_model first.
+      - Apply LoRA to attention Linear layers in the last 2 blocks.
+      - Full fine-tune non-attention submodules in the last 2 blocks.
+      - Unfreeze attn_pool_contrast and ln_contrast.
+    """
+    # 1. Freeze entire hist_model
+    freeze_model_parameters(hist_model)
+
+    # 2. Get ViT blocks
+    blocks = hist_model.trunk.blocks
+
+    # 3. Only process last 2 blocks
+    for i, block in enumerate(blocks):
+        if i >= len(blocks) - 2:
+            # Apply LoRA to attention Linear layers (qkv, proj)
+            if hasattr(block, 'attn'):
+                apply_lora_to_linear_children(
+                    block.attn,
+                    rank=lora_rank,
+                    alpha=lora_alpha,
+                    dropout=lora_dropout,
+                )
+            # Full fine-tuning for all other submodules in this block
+            for name, child in block.named_children():
+                if name != 'attn':
+                    for param in child.parameters():
+                        param.requires_grad = True
+
+    # 4. Unfreeze attn_pool_contrast and ln_contrast
+    for param in hist_model.attn_pool_contrast.parameters():
+        param.requires_grad = True
+    for param in hist_model.ln_contrast.parameters():
+        param.requires_grad = True
+
+
+def build_static_hist_flow_cache(
+    dataset,
+    cache_path,
+    hist_flow_rna,
+    rna_flow,
+    batch_size=512,
+    steps=60,
+    device="cuda",
+):
+    """Pre-compute static features from frozen pretrained models and save to cache.
+
+    Uses the dataset's image loading pipeline (center-crop, normalize) to ensure
+    consistency with training. Outputs a single .pt dict:
+
+        {
+            "image_paths": list[str],
+            "hist_features": [N, 512],
+            "hist_celltype_prob": [N, n_celltypes],
+            "pred_rna_emb": [N, 512],
+            "pred_prot_emb": [N, 512],
+        }
+
+    Args:
+        dataset: ProteinExpressionDataset instance (without static_feature_path).
+        cache_path: Path to save the .pt cache file.
+        hist_flow_rna: Frozen HistFlowRNA model.
+        rna_flow: Frozen ConditionalFlowNet for RNA→protein transformation.
+        batch_size: Batch size for the temporary DataLoader.
+        steps: Number of RK4 integration steps.
+        device: Device for inference.
+    """
+    if os.path.exists(cache_path):
+        print(f"Static cache already exists at {cache_path}, skipping generation.")
+        return
+
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+
+    hist_flow_rna.eval()
+    rna_flow.eval()
+
+    hist_flow_rna = hist_flow_rna.to(device)
+    rna_flow = rna_flow.to(device)
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=1,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    all_hist_features = []
+    all_hist_celltype_prob = []
+    all_pred_rna_emb = []
+    all_pred_prot_emb = []
+
+    with torch.no_grad():
+        for batch in tqdm(loader):
+            image = batch[0].to(device)
+
+            # Get histology features via frozen HistFlowRNA
+            image_latent, pred_rna_emb, hist_features, hist_celltype_prob = (
+                hist_flow_rna.encode_image_to_rna_emb(image, steps=steps)
+            )
+
+            # Generate pred_prot_emb using frozen RNA→protein flow
+            pred_prot_emb = integrate_flow(
+                rna_flow,
+                pred_rna_emb,
+                steps=steps,
+                cond_vec=hist_celltype_prob,
+            )
+
+            all_hist_features.append(hist_features.detach().cpu().float())
+            all_hist_celltype_prob.append(hist_celltype_prob.detach().cpu().float())
+            all_pred_rna_emb.append(pred_rna_emb.detach().cpu().float())
+            all_pred_prot_emb.append(pred_prot_emb.detach().cpu().float())
+
+    cache = {
+        "image_paths": list(dataset.image_paths),
+        "hist_features": torch.cat(all_hist_features, dim=0),
+        "hist_celltype_prob": torch.cat(all_hist_celltype_prob, dim=0),
+        "pred_rna_emb": torch.cat(all_pred_rna_emb, dim=0),
+        "pred_prot_emb": torch.cat(all_pred_prot_emb, dim=0),
+    }
+    torch.save(cache, cache_path)
+    print(f"Static cache saved to {cache_path} "
+          f"({len(cache['image_paths'])} samples, "
+          f"hist_features: {cache['hist_features'].shape}, "
+          f"pred_rna_emb: {cache['pred_rna_emb'].shape}, "
+          f"pred_prot_emb: {cache['pred_prot_emb'].shape})")
+
+
 if __name__ == '__main__':
 
-    batch_size = 1500
+    batch_size = 2560  # 5120
 
-    pos = pd.read_parquet('/macroverse-nas/pjz/proteomics/rcc_xenium_lr/pos_filtered.parquet')
-    train_barcodes = pos[pos['split'] == 'train'].index.tolist()
-    test_barcodes  = pos[pos['split'] == 'test'].index.tolist()
+    train_df = pd.read_csv('../predict_exp/data/train_norm.csv')
+    val_df = pd.read_csv('../predict_exp/data/val_norm_filtered.csv')
+    train_df.columns = ['new_filenames', 'PECAM1', 'PTPRC', 'CD68', 'CD4', 'FOXP3', 'CD8A', 'PTPRCRO', 'MS4A1', 'CD274', 'CD3E', 'CD163', 'CDH1', 'MKI67', 'KRT19', 'ACTA2']
+    val_df.columns = ['new_filenames', 'PECAM1', 'PTPRC', 'CD68', 'CD4', 'FOXP3', 'CD8A', 'PTPRCRO', 'MS4A1', 'CD274', 'CD3E', 'CD163', 'CDH1', 'MKI67', 'KRT19', 'ACTA2']
 
-    train_dataset = SpatialDataset(
-        barcode_tsv = train_barcodes,
-        image_path='/macroverse-nas/pjz/proteomics/rcc_xenium/Xenium_V1_Human_Kidney_FFPE_normalized_he_image.ome.tif',
-        spatial_pos_path='/macroverse-nas/pjz/proteomics/rcc_xenium_lr/pos_filtered.parquet',
-        count_mtx_path='/macroverse-nas/pjz/proteomics/rcc_xenium_lr/rna_exp_filtered_train.parquet',
-        protein_exp_path='/macroverse-nas/pjz/proteomics/rcc_xenium_lr/prot_exp_scale_filtered_train.parquet',
-        enrichment_path='/macroverse-nas/pjz/proteomics/rcc_xenium_lr/train_enrichment_filtered_train.parquet',
+    val_df['sample_name'] = val_df['new_filenames'].apply(lambda x: x.split('/')[1].split('__')[0])
+    sample_dfs = {
+        sample: group.drop(columns=['sample_name']).reset_index(drop=True)
+        for sample, group in val_df.groupby('sample_name')
+    }
+
+    # === Step 1: Create raw datasets (no static features) for cache generation ===
+    train_dataset_raw = ProteinExpressionDataset(
+        train_df,
         scgpt_model_path='/macroverse-nas/pjz/proteomics/data_model/scgpt_model',
-        protein_emb_path='/macroverse-nas/pjz/proteomics/train_brca/pickle/Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM2_new.pt'
+        protein_emb_path='/macroverse-nas/pjz/proteomics/train_brca/pickle/Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM2_new.pt',
     )
-    test_dataset = SpatialDataset(
-        barcode_tsv = test_barcodes,
-        image_path='/macroverse-nas/pjz/proteomics/rcc_xenium/Xenium_V1_Human_Kidney_FFPE_normalized_he_image.ome.tif',
-        spatial_pos_path='/macroverse-nas/pjz/proteomics/rcc_xenium_lr/pos_filtered.parquet',
-        count_mtx_path='/macroverse-nas/pjz/proteomics/rcc_xenium_lr/rna_exp_filtered_test.parquet',
-        protein_exp_path='/macroverse-nas/pjz/proteomics/rcc_xenium_lr/prot_exp_scale_filtered_test.parquet',
-        enrichment_path='/macroverse-nas/pjz/proteomics/rcc_xenium_lr/train_enrichment_filtered_test.parquet',
-        scgpt_model_path='/macroverse-nas/pjz/proteomics/data_model/scgpt_model',
-        protein_emb_path='/macroverse-nas/pjz/proteomics/train_brca/pickle/Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM2_new.pt'
-    )
+    train_protein = train_dataset_raw.get_protein_names()
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=1, pin_memory=True, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=1, pin_memory=True, drop_last=False)
+    val_dataset_raw = {}
+    for sample_name, sample_df in sample_dfs.items():
+        val_dataset_raw[sample_name] = ProteinExpressionDataset(
+            sample_df,
+            scgpt_model_path='/macroverse-nas/pjz/proteomics/data_model/scgpt_model',
+            protein_emb_path='/macroverse-nas/pjz/proteomics/train_brca/pickle/Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM2_new.pt',
+        )
 
-    total_test_samples = len(test_loader.dataset)
-    train_protein = train_dataset.get_protein_names()
-
-    # load pretrained weights: hist-rna
+    # === Step 2: Load pretrained models ===
     scgpt_model_path = "/macroverse-nas/pjz/proteomics/data_model/scgpt_model"
     coach_checkpoint_path = "/macroverse-nas/pjz/proteomics/data_model/coach_model/pytorch_model.bin"
     reference_embedding_path = "/macroverse-nas/pjz/crc_codex/pretrain/data/reference_embedding.csv"
+
+    spatial_rna_model = build_scgpt_model()
+    protein_model = build_scgpt_model()
 
     model_cfg = 'conch_ViT-B-16'
     path_model_full, preprocess = create_model_from_pretrained(
@@ -532,40 +834,125 @@ if __name__ == '__main__':
     flow_model = ConditionalFlowNet(
         source_dim=512,
         to_dim=512,
-        cond_dim=0,     
+        cond_dim=0,
         hidden_dim=1024
     )
 
-    # load pretrained weights: rna-protein
-    flow_model_prot = ConditionalFlowNet(512, 512, 40)
-    # flow_model_prot = load_pretrained_model(model = flow_model_prot, 
-    #                                  pretrained_weights_path = '/root/code/crc_codex/predict_exp/flow_model.pt', device='cpu')
-
-    for p in path_model_visual.parameters():
-        p.requires_grad = False
-
-    for p in flow_model_prot.parameters():
-        p.requires_grad = True
-
-    rna_model = build_scgpt_model()
-    protein_model = build_scgpt_model()
-    for p in rna_model.parameters(): p.requires_grad = False
-    for p in protein_model.parameters(): p.requires_grad = False
-    
-    model = ImageToProteinModel(path_model_visual, rna_model, protein_model, flow_model_prot, 512, 5120, 27, train_protein)
-    
-    optimizer = optim.Adam(model.parameters(), lr=0.0003)
-    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
-    model, flow_model_prot, optimizer, scheduler, train_loader, test_loader = accelerator.prepare(
-        model, flow_model_prot, optimizer, scheduler, train_loader, test_loader
+    hist_flow_rna = HistFlowRNA(
+        rna_model=spatial_rna_model,
+        hist_model=path_model_visual,
+        class_embeddings=class_embeddings,
+        flow_model=flow_model
+    )
+    hist_flow_rna = load_pretrained_model(
+        model=hist_flow_rna,
+        pretrained_weights_path='/macroverse-nas/pjz/crc_codex/pretrain/pickle/HistFlowRNA_final_kl_new.pt',
+        device='cpu',
     )
 
-    if accelerator.is_main_process:
-        accelerator.print(f"Test loader 中总共有 {total_test_samples} 个样本。")
-    train_and_evaluate(model, protein_model, train_loader, test_loader, optimizer, scheduler, train_protein, num_epochs=60)
+    # RNA→protein flow (frozen, used only for cache generation)
+    flow_model_prot = ConditionalFlowNet(512, 512, 40)
+    for p in flow_model_prot.parameters():
+        p.requires_grad = False
 
-    # # if accelerator.is_main_process:  
-    # #     unwrapped_model = accelerator.unwrap_model(model)
-    # #     save_path = "/macroverse-nas/pjz/crc_codex/codex/codex/model/image_to_protein_final.pt"
-    # #     torch.save(unwrapped_model.state_dict(), save_path)
-    # #     print(f"Model weights saved to {save_path}")
+    ## === Step 3: Generate static feature caches (BEFORE LoRA, from original pretrained weights) ===
+    os.makedirs("/macroverse-nas/pjz/crc_codex/codex/cache", exist_ok=True)
+
+    build_static_hist_flow_cache(
+        dataset=train_dataset_raw,
+        cache_path="/macroverse-nas/pjz/crc_codex/codex/cache/train_hist_flow_static.pt",
+        hist_flow_rna=hist_flow_rna,
+        rna_flow=flow_model_prot,
+        batch_size=4096,
+        steps=60,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+    )
+
+    for sample_name, ds_raw in val_dataset_raw.items():
+        build_static_hist_flow_cache(
+            dataset=ds_raw,
+            cache_path=f"/macroverse-nas/pjz/crc_codex/codex/cache/val_{sample_name}_hist_flow_static.pt",
+            hist_flow_rna=hist_flow_rna,
+            rna_flow=flow_model_prot,
+            batch_size=5120,
+            steps=60,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+
+    # === Step 4: Re-create datasets with static feature caches ===
+    train_dataset = ProteinExpressionDataset(
+        train_df,
+        scgpt_model_path='/macroverse-nas/pjz/proteomics/data_model/scgpt_model',
+        protein_emb_path='/macroverse-nas/pjz/proteomics/train_brca/pickle/Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM2_new.pt',
+        static_feature_path="/macroverse-nas/pjz/crc_codex/codex/cache/train_hist_flow_static.pt",
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=1,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    val_dataset = {}
+    val_loader = {}
+    for sample_name, sample_df in sample_dfs.items():
+        dataset = ProteinExpressionDataset(
+            sample_df,
+            scgpt_model_path='/macroverse-nas/pjz/proteomics/data_model/scgpt_model',
+            protein_emb_path='/macroverse-nas/pjz/proteomics/train_brca/pickle/Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM2_new.pt',
+            static_feature_path=f"/macroverse-nas/pjz/crc_codex/codex/cache/val_{sample_name}_hist_flow_static.pt",
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=4096,
+            shuffle=False,
+            num_workers=1,
+            pin_memory=True,
+            drop_last=False,
+        )
+        val_dataset[sample_name] = dataset
+        val_loader[sample_name] = dataloader
+
+    # === Step 5: Freeze hist_flow_rna, then enable LoRA on hist_model ===
+    for p in hist_flow_rna.parameters():
+        p.requires_grad = False
+
+    enable_hist_model_lora(
+        hist_flow_rna.hist_model,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+    )
+
+    # === Step 6: Construct model and optimizer (only trainable params) ===
+    model = ImageToProteinModel(
+        hist_flow_rna, flow_model_prot, 512, 5120, 15, train_protein
+    )
+
+    optimizer = optim.Adam(
+        (p for p in model.parameters() if p.requires_grad),
+        lr=0.0015,
+    )
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+
+    # === Step 7: Accelerator prepare ===
+    model, protein_model, optimizer, scheduler, train_loader = accelerator.prepare(
+        model,
+        protein_model,
+        optimizer,
+        scheduler,
+        train_loader,
+    )
+
+    # Prepare validation loaders
+    val_loader = {
+        sample_name: accelerator.prepare(dataloader)
+        for sample_name, dataloader in val_loader.items()
+    }
+
+    train_and_evaluate(
+        model, protein_model, train_loader, val_loader,
+        optimizer, scheduler, train_protein, num_epochs=30,
+    )

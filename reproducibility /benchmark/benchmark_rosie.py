@@ -15,11 +15,11 @@ from PIL import Image
 import torch.nn.functional as F
 from Dataset import ProteinExpressionDataset
 import os
-# 导入 accelerate
+# Import accelerate
 from accelerate import Accelerator
 
 # ==========================================
-# 1. 模型定义
+# 1. Model Definition
 # ==========================================
 def get_model(num_outputs: Optional[int] = None) -> nn.Module:
 
@@ -35,12 +35,12 @@ def get_model(num_outputs: Optional[int] = None) -> nn.Module:
     return model
 
 # ==========================================
-# 2. 相关性计算辅助函数
+# 2. Correlation Calculation Helper Functions
 # ==========================================
 def calculate_metrics(preds, targets):
     """
     preds/targets: (N, Num_Proteins) torch tensors
-    返回: (mean_pcc, mean_scc, list_pcc, list_scc)
+    Returns: (mean_pcc, mean_scc, list_pcc, list_scc)
     """
     preds = preds.detach().cpu().numpy()
     targets = targets.detach().cpu().numpy()
@@ -52,7 +52,7 @@ def calculate_metrics(preds, targets):
     for i in range(num_proteins):
         p = preds[:, i]
         t = targets[:, i]
-        # 处理标准差为0的情况，避免报错
+        # Handle zero standard deviation case to avoid errors
         if np.std(p) < 1e-6 or np.std(t) < 1e-6:
             pcc, scc = 0.0, 0.0
         else:
@@ -64,18 +64,18 @@ def calculate_metrics(preds, targets):
     return np.mean(pccs), np.mean(sccs), pccs, sccs
 
 # ==========================================
-# 3. 训练主流程
+# 3. Main Training Loop
 # ==========================================
 def train():
-    # 初始化 Accelerator
+    # Initialize Accelerator
     accelerator = Accelerator()
     
-    # 参数设置
+    # Parameter settings
     BATCH_SIZE = 5120
     LR = 1e-4
     NUM_EPOCHS = 50
 
-    # --- 1. 数据准备 ---
+    # --- 1. Data Preparation ---
     if accelerator.is_main_process:
         print("Loading data...")
     train_df = pd.read_csv('/mnt/vdd/pjz/crc/ORIONCRC_dataset_tile_20x/train_ori.csv')
@@ -88,43 +88,43 @@ def train():
     train_df.columns = col_names
     val_df.columns = col_names
     
-    # 验证集按样本分组
+    # Group validation set by sample
     val_df['sample_name'] = val_df['new_filenames'].apply(lambda x: x.split('/')[1].split('__')[0])
     sample_dfs = {
         sample: group.drop(columns=['sample_name']).reset_index(drop=True) 
         for sample, group in val_df.groupby('sample_name')
     }
     
-    # 实例化训练集
+    # Instantiate training set
     train_dataset = ProteinExpressionDataset(train_df)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=1, pin_memory=True, drop_last=True)
     
-    # 获取蛋白列表
+    # Get protein list
     protein_names = train_dataset.get_protein_names()
     num_proteins = len(protein_names)
 
-    # 准备验证集 Dataloaders 字典
+    # Prepare validation set Dataloaders dictionary
     val_loaders_dict = {}
     for sample_name, s_df in sample_dfs.items():
         v_dataset = ProteinExpressionDataset(s_df)
         v_loader = DataLoader(v_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=1, pin_memory=True, drop_last=False)
         val_loaders_dict[sample_name] = v_loader
 
-    # --- 2. 模型与优化器 ---
+    # --- 2. Model and Optimizer ---
     model = get_model(num_outputs=num_proteins)
     optimizer = optim.AdamW(model.parameters(), lr=LR)
     criterion = nn.MSELoss()
 
-    # --- 3. 使用 Accelerator Prepare ---
+    # --- 3. Use Accelerator Prepare ---
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     
     for sample_name in val_loaders_dict:
         val_loaders_dict[sample_name] = accelerator.prepare(val_loaders_dict[sample_name])
 
-    # --- 4. 训练循环 ---
+    # --- 4. Training Loop ---
     for epoch in range(NUM_EPOCHS):
         # ==========================================
-        # 1. 训练阶段 (Training)
+        # 1. Training Phase
         # ==========================================
         model.train()
         total_train_loss = 0.0
@@ -133,32 +133,32 @@ def train():
         all_preds = []
         all_targets = []
         
-        # 遍历训练集
+        # Iterate over training set
         for batch in train_loader:
             images, targets = batch
             
-            # 前向传播
+            # Forward pass
             outputs = model(images)
             loss = criterion(outputs, targets)
             
-            # 反向传播
+            # Backward pass
             optimizer.zero_grad()
             accelerator.backward(loss)
             optimizer.step()
             
-            # --- 记录指标 ---
-            # 为了不拖慢训练，我们在每个 batch 上计算一次 PCC/SCC 并记录
-            # 注意：这里计算的是"当前 batch 的平均 PCC"，仅用于监控收敛趋势
-            # detach() 很重要，防止梯度图累积
+            # --- Record metrics ---
+            # To avoid slowing down training, we compute PCC/SCC on each batch and record it.
+            # Note: This computes the "average PCC of the current batch", only for monitoring convergence trends.
+            # detach() is important to prevent gradient graph accumulation.
             batch_pcc, batch_scc, _, _ = calculate_metrics(outputs, targets)
             
             total_train_loss += loss.item()
             train_pccs.append(batch_pcc)
             train_sccs.append(batch_scc)
             
-        # --- 计算并输出训练集本轮汇总 ---
-        # 收集所有 GPU 上的指标取平均（为了打印准确，这里简化为只打印主进程看到的平均值，
-        # 通常足够观察趋势。若要绝对精确可使用 accelerator.gather）
+        # --- Compute and output training set summary for this epoch ---
+        # Gather metrics across all GPUs and average (for simplicity, we only print the average seen by the main process,
+        # which is usually sufficient for monitoring trends. Use accelerator.gather for absolute precision.)
         avg_train_loss = total_train_loss / len(train_loader)
         avg_train_pcc = np.mean(train_pccs)
         avg_train_scc = np.mean(train_sccs)
@@ -175,14 +175,14 @@ def train():
 
             results = []
 
-            # 全局统计（现有）
+            # Global statistics (existing)
             epoch_avg_pearsons = []
             epoch_avg_spearmans = []
 
-            # ===== 新增：收集所有样本的每蛋白 PCC =====
-            # 用于存储 shape: (num_samples, num_proteins)
+            # ===== New: Collect per-protein PCC for all samples =====
+            # For storing shape: (num_samples, num_proteins)
             all_samples_list_pcc = []
-            all_samples_list_scc = []  # 如你以后也想做 Spearman 可留着
+            all_samples_list_scc = []  # Keep this if you want Spearman later too
 
             if (epoch + 1) == NUM_EPOCHS and accelerator.is_main_process:
                 os.makedirs('result/corr', exist_ok=True)
@@ -221,8 +221,8 @@ def train():
                             'min_spearman': np.min(list_scc)
                         })
 
-                        # ===== 新增：把每蛋白 PCC 收集起来 =====
-                        # list_pcc 一般是长度 = num_proteins 的 array/list
+                        # ===== New: Collect per-protein PCC =====
+                        # list_pcc is typically an array/list of length = num_proteins
                         all_samples_list_pcc.append(np.array(list_pcc, dtype=np.float32))
                         all_samples_list_scc.append(np.array(list_scc, dtype=np.float32))
 
@@ -236,7 +236,7 @@ def train():
                         csv_path = os.path.join(save_dir, f"{sample_name}.csv")
                         df_corr.to_csv(csv_path)
 
-            # --- 验证结束，输出汇总 ---
+            # --- Validation finished, output summary ---
             if accelerator.is_main_process:
                 print(f"\n" + "="*30 + f" Epoch {epoch+1} Test Summary (Train Loss: {avg_train_loss:.4f}) " + "="*30)
 
@@ -258,27 +258,27 @@ def train():
                 for r in results:
                     print(f"{r['sample_name']:<25} | {r['avg_pearson']:<12.4f} | {r['max_pearson']:<12.4f} | {r['min_pearson']:<12.4f} | {r['avg_spearman']:<12.4f}")
 
-                # ===== 新增：每个蛋白平均 PCC + 这些平均 PCC 的均值/中位数 =====
+                # ===== New: Per-protein average PCC + mean/median of these average PCCs =====
                 all_samples_list_pcc = np.stack(all_samples_list_pcc, axis=0)  # (num_samples, num_proteins)
 
-                # 每个蛋白在所有测试样本上的平均 Pearson
+                # Average Pearson of each protein across all test samples
                 protein_mean_pcc = np.mean(all_samples_list_pcc, axis=0)       # (num_proteins,)
 
-                # 这些“蛋白的平均 PCC”在蛋白维度的统计
+                # Statistics of “protein average PCC” across the protein dimension
                 protein_mean_pcc_avg = float(np.mean(protein_mean_pcc))
                 protein_mean_pcc_median = float(np.median(protein_mean_pcc))
 
                 print("\n[Per-protein PCC across all test samples]")
                 print(f"Protein-wise mean PCC -> Mean over proteins: {protein_mean_pcc_avg:.4f}, Median over proteins: {protein_mean_pcc_median:.4f}")
 
-                # 如果你有 protein_names，就逐个蛋白打印
-                # 注意：这里假设 protein_names 长度 == num_proteins
+                # If you have protein_names, print per protein
+                # Note: assumes protein_names length == num_proteins
                 if 'protein_names' in globals():
                     print("\nProtein\t\tMean_PCC(over samples)")
                     for i, pname in enumerate(protein_names):
                         print(f"{pname}\t\t{protein_mean_pcc[i]:.4f}")
                 else:
-                    # 没有 protein_names 就只打印数值索引
+                    # If no protein_names, just print numeric indices
                     print("\nProtein_idx\tMean_PCC(over samples)")
                     for i in range(protein_mean_pcc.shape[0]):
                         print(f"{i}\t\t{protein_mean_pcc[i]:.4f}")

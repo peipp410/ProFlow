@@ -1,16 +1,10 @@
-# -*- coding: utf-8 -*-
-import os
-# import cv2
-import pandas as pd
 import torch
-from sklearn.decomposition import TruncatedSVD
-from skimage.io import imread, imshow
-# from skimage.measure import regionprops
-# from skimage.util import crop
-# from csbdeep.utils import normalize
-# from stardist.models import StarDist2D
-# from shapely.geometry import Polygon, Point
-# from scipy.sparse import csr_matrix
+from torch.utils.data import Dataset
+import pandas as pd
+import numpy as np
+from PIL import Image
+import torchvision.transforms as transforms
+import os
 import tifffile
 import numpy as np
 import torchvision.transforms.functional as TF
@@ -28,11 +22,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Mapping, Tuple, Union
 from tqdm.auto import tqdm  # Use tqdm.auto for notebook/console compatibility
 import logging
-from skimage.filters import threshold_li
 
-# 设置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 @dataclass
 class DataCollator:
@@ -215,132 +205,48 @@ def binning(
     return torch.from_numpy(binned_row) if not return_np else binned_row.astype(dtype)
 
 
-class SpatialDataset(torch.utils.data.Dataset):
-    def __init__(self, barcode_tsv,
-                 image_path,
-                 spatial_pos_path,
-                 count_mtx_path,
-                 protein_exp_path,
-                 enrichment_path,
-                 scgpt_model_path,
-                 protein_emb_path,
-                 augment_factor=1):
-        # self.whole_image = imread(image_path)
-        with tifffile.TiffFile(image_path) as tif:
-            self.whole_image = tif.pages[0].asarray()
-        if self.whole_image is None:
-            raise ValueError(f"Image at path {image_path} could not be loaded.")
+class ProteinExpressionDataset(Dataset):
+    def __init__(self, dataframe, scgpt_model_path, transform=None, protein_emb_path=None, static_feature_path=None):
+        """
+        PyTorch Dataset for loading H&E images and protein expression data.
 
-        self.spatial_pos_csv = pd.read_parquet(spatial_pos_path)
-        # self.spatial_pos_csv = self.spatial_pos_csv.reset_index(drop=True)
-        self.barcode_tsv = barcode_tsv
-
-        self.count_matrix = pd.read_parquet(count_mtx_path, engine='pyarrow')  # features * cell
-        # self.count_matrix = self.count_matrix.reset_index(drop=True)
-        # self.genes = self.count_matrix.index.values
-
-        self.protein_exp = pd.read_parquet(protein_exp_path)
-        # self.protein_exp = self.protein_exp.drop(columns=['CD45RA-1', 'CD45RO-1'])
-        self.protein_exp.columns = ['PDCD1', 'VSIR', 'CD274', 'LAG3', 'FCGR3A', 'GZMB', 'CD163', 'CD4', 'MS4A1', 'CD8A', 'CD3E', 'SDC1', 'HLA-DRA', 'ITGAX', 'CD68', 'PTPRCRA', 'PCNA', 'PTPRCRO', 'MKI67', 'CTNNB1', 'PECAM1', 'PTEN', 'KRT19', 'VIM', 'ACTA2', 'PTPRC', 'CDH1']
-
-        # self.protein_exp = np.log1p(self.protein_exp)
-
-        self.enrichment = pd.read_parquet(enrichment_path)
-        self.enrichment = self.enrichment.values
-
-        if protein_emb_path:
-            protein_embedding = torch.load(protein_emb_path)  # Load pre-trained embeddings
-            # Process embeddings to align with the protein names in DataFrame
-            self.protein_emb, self.protein_exp, self.protein_names = self._extract_embeddings_to_numpy(protein_embedding, self.protein_exp)
-
-
-        # self.protein_expression = (
-        #     self.protein_expression - np.mean(self.protein_expression, axis=0)
-        # ) / np.std(self.protein_expression, axis=0)
-
-        self.augment_factor = augment_factor
-
-        self.scgpt_model_dir = Path(scgpt_model_path)
-
-        all_zeros = (self.count_matrix.abs() < 1e-9).all(axis=1)
-        self.zero_rows_index = all_zeros[all_zeros].index.tolist()
-        if self.zero_rows_index:  # 检查 zero_rows_index 是否非空
-            self.count_matrix.loc[self.zero_rows_index, self.count_matrix.columns[:2]] = 1
-        #print("Finished loading all files")
-        # self.seg_model = StarDist2D.from_pretrained('2D_versatile_he')
-        # self.whole_image_norm = normalize(self.whole_image, 5, 95)
-        # self.all_labels, _ = self.seg_model.predict_instances(self.whole_image_norm, prob_thresh=0.2)
-
-        # self.all_labels = np.array(imread(cell_label_path))
-
-        
-        self.augmentations = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            # transforms.RandomRotation(degrees=(0, 360)),
-            # transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.01),
-            # transforms.RandomResizedCrop(size=(256, 256), scale=(0.8, 1.0)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
-        ])
+        Args:
+            dataframe (pd.DataFrame): DataFrame where:
+                - The first column contains the file paths to H&E JPEG images.
+                - The remaining columns contain protein expression values.
+                - The column names (after the first column) are protein names.
+            transform (callable, optional): Transformation to be applied to H&E images.
+            protein_emb_path (str, optional): Path to the pre-trained protein embeddings.
+            static_feature_path (str, optional): Path to pre-computed static features cache (.pt).
+        """
+        self.dataframe = dataframe
+        self.image_paths = dataframe.iloc[:, 0].values  # JPEG image file paths
+        self.protein_expression = dataframe.iloc[:, 1:]  # Protein expression values
+        self.protein_names = dataframe.columns[1:]  # Protein column names
+        self.transform = transform
+        self.protein_emb = None
         self.non_augmentations = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
         ])
-        self.resnet_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        self.scgpt_model_dir = Path(scgpt_model_path)
 
-        # 在 __init__ 中预处理 scGPT 输入
-        self.input_gene_ids, self.expressions, self.src_key_padding_mask = self._constract_scgpt_input(self.count_matrix, self.scgpt_model_dir)
+        # Load protein embeddings if protein_emb_path is provided
+        if protein_emb_path:
+            protein_embedding = torch.load(protein_emb_path)  # Load pre-trained embeddings
+            # Process embeddings to align with the protein names in DataFrame
+            self.protein_emb, self.protein_exp, self.protein_names = self._extract_embeddings(protein_embedding, self.protein_expression)
+
         self.input_protein_ids, self.protein_expressions, self.src_key_padding_mask_protein = self._constract_scgpt_input(self.protein_exp, self.scgpt_model_dir)
-        # self.protein_expression = (self.protein_exp.values - self.protein_exp.values.mean(axis=0)) / self.protein_exp.values.std(axis=0) ### scale
         self.protein_expression = self.protein_exp.values
+        self.protein_expression = np.log1p(self.protein_expression)
 
-        # 预先计算细胞分割结果 (如果GPU内存允许)
-        # self.precomputed_segmentations = self._precompute_segmentations()
-        self.failed_indices = []
-        # for _ in self.zero_rows_index:
-        #     self.failed_indices.append(_) #用于存储失败的索引
+        # Load static features cache if provided
+        self.static_features = None
+        if static_feature_path is not None:
+            self.static_features = torch.load(static_feature_path, map_location="cpu")
+            self._validate_static_features()
 
-    def _extract_embeddings_to_numpy(self, emb_dict, exp_data):
-        """
-        Extract and align protein embeddings with the columns (proteins) in the expression data.
-
-        Args:
-            emb_dict (dict): Dictionary of embeddings keyed by protein names.
-            exp_data (np.ndarray): Protein expression data from DataFrame.
-
-        Returns:
-            Tuple:
-                - final_embeddings_array (np.ndarray): Extracted protein embeddings as a stacked array.
-                - exp_data (np.ndarray): Updated protein expression data (aligned with embeddings).
-                - keys_to_extract (list): List of protein names that match embeddings.
-        """
-        keys_to_extract = exp_data.columns.tolist()  # Protein names in the DataFrame
-        extracted_embeddings = []
-        keys_missing = []
-        
-        for key in keys_to_extract:
-            if key in emb_dict:
-                # Append the embedding for the current protein
-                extracted_embeddings.append(emb_dict[key])
-            else:
-                # Keep track of missing keys
-                keys_missing.append(key)
-
-        # Stack embeddings into a single numpy array
-        if not extracted_embeddings:
-            raise ValueError("No matching protein embeddings found in the embedding dictionary.")
-        
-        final_embeddings_array = np.vstack(extracted_embeddings)
-
-        # Remove missing proteins from expression data
-        if keys_missing:
-            exp_data = exp_data.drop(columns=keys_missing)
-
-        return final_embeddings_array, exp_data, exp_data.columns.tolist()
 
     def _constract_scgpt_input(self, input_count_matrix, scgpt_model_dir):
         vocab_file = scgpt_model_dir / "vocab.json"
@@ -381,15 +287,6 @@ class SpatialDataset(torch.utils.data.Dataset):
             genes = np.insert(genes, 0, vocab["<cls>"])
             values = np.insert(values, 0, model_configs.get("pad_value", 0))  # Use get for safety
             all_examples.append({"genes": genes, "expressions": values})
-
-        # for i in range(count_matrix.shape[0]):
-        #     row = count_matrix[i]
-        #     genes = gene_ids
-        #     values = row
-        #     # Prepend <cls> token
-        #     genes = np.insert(genes, 0, vocab["<cls>"])
-        #     values = np.insert(values, 0, model_configs.get("pad_value", 0))
-        #     all_examples.append({"genes": genes, "expressions": values})
         
         collator = DataCollator(
             do_padding=True,
@@ -413,107 +310,157 @@ class SpatialDataset(torch.utils.data.Dataset):
 
         return input_gene_ids, expressions, src_key_padding_mask
 
-    def transform(self, image, augment_idx):
-        image = Image.fromarray(image)
-        if augment_idx > 0:
-            image = self.augmentations(image)
-        else:
-            image = self.non_augmentations(image)
-        return image
 
+    def _extract_embeddings(self, emb_dict, exp_data):
+        """
+        Extract and align protein embeddings with the columns (proteins) in the expression data.
+
+        Args:
+            emb_dict (dict): Dictionary of embeddings keyed by protein names.
+            exp_data (np.ndarray): Protein expression data from DataFrame.
+
+        Returns:
+            Tuple:
+                - final_embeddings_array (np.ndarray): Extracted protein embeddings as a stacked array.
+                - exp_data (np.ndarray): Updated protein expression data (aligned with embeddings).
+                - keys_to_extract (list): List of protein names that match embeddings.
+        """
+        keys_to_extract = exp_data.columns.tolist()  # Protein names in the DataFrame
+        extracted_embeddings = []
+        keys_missing = []
+        
+        for key in keys_to_extract:
+            if key in emb_dict:
+                # Append the embedding for the current protein
+                extracted_embeddings.append(emb_dict[key])
+            else:
+                # Keep track of missing keys
+                keys_missing.append(key)
+
+        # Stack embeddings into a single numpy array
+        if not extracted_embeddings:
+            raise ValueError("No matching protein embeddings found in the embedding dictionary.")
+        
+        final_embeddings_array = np.vstack(extracted_embeddings)
+
+        # Remove missing proteins from expression data
+        if keys_missing:
+            exp_data = exp_data.drop(columns=keys_missing)
+
+        return final_embeddings_array, exp_data, exp_data.columns.tolist()
+
+    def _validate_static_features(self):
+        """Validate that the static features cache matches the dataset.
+
+        Checks:
+          1. All required keys are present.
+          2. Number of image paths matches the dataset.
+          3. Image path ordering is identical (raises ValueError on mismatch).
+          4. All tensors have matching first dimension.
+        """
+        required_keys = {
+            "image_paths",
+            "hist_features",
+            "hist_celltype_prob",
+            "pred_rna_emb",
+            "pred_prot_emb",
+        }
+        cache = self.static_features
+        missing = required_keys - set(cache.keys())
+        if missing:
+            raise ValueError(f"Static features cache missing keys: {missing}")
+
+        cache_paths = cache["image_paths"]
+        if len(cache_paths) != len(self.image_paths):
+            raise ValueError(
+                f"Cache has {len(cache_paths)} entries but dataset has "
+                f"{len(self.image_paths)} entries."
+            )
+
+        # Verify order consistency — mismatch would silently pair wrong features
+        if cache_paths != self.image_paths.tolist():
+            raise ValueError(
+                "Static features cache image_paths order does not match "
+                "dataset image_paths order."
+            )
+
+        n = len(self.image_paths)
+        for key in ["hist_features", "hist_celltype_prob", "pred_rna_emb", "pred_prot_emb"]:
+            t = cache[key]
+            if t.shape[0] != n:
+                raise ValueError(
+                    f"Static feature '{key}' has {t.shape[0]} rows, expected {n}."
+                )
+
+    def __len__(self):
+        """
+        Returns the total number of samples in the dataset.
+        """
+        return len(self.dataframe)
 
     def __getitem__(self, idx):
+        """
+        Retrieves a single data point from the dataset.
 
-        actual_idx = idx
-        augment_idx = idx // len(self.barcode_tsv)
+        Args:
+            idx (int): Index of the sample to retrieve.
 
-        # 如果索引在失败列表中，跳过
-        if actual_idx in self.failed_indices:
-            return None # 或者返回一个默认的空样本
-
-        item = {}
-        barcode = self.barcode_tsv[actual_idx]
-
-        # 检查 barcode 是否在零行索引中
-        if barcode in self.zero_rows_index:
-            logging.warning(f"Barcode {barcode} is in zero rows index. Skipping.")
-            self.failed_indices.append(idx) #将失败的索引添加
-            return None
-
-        spatial_info = self.spatial_pos_csv.loc[[barcode]]
-        # celltype_info = self.cell_deconv_matrix[actual_idx]
-
-        # 从预处理的数据中获取
-        input_gene_ids = self.input_gene_ids[actual_idx]
-        expressions = self.expressions[actual_idx]
-        src_key_padding_mask = self.src_key_padding_mask[actual_idx]
-        input_protein_ids = self.input_protein_ids[actual_idx]
-        protein_expressions = self.protein_expressions[actual_idx]
-        src_key_padding_mask_protein = self.src_key_padding_mask_protein[actual_idx]
-
-        protein_expression = self.protein_expression[actual_idx].astype(np.float32)
-
-
-        if spatial_info.empty:
-            logging.warning(f"Warning: No spatial information found for barcode {barcode}. Skipping.")
-            self.failed_indices.append(idx)
-            return None
-
+        Returns:
+            Tuple:
+                - image (numpy.ndarray): H&E image as a numpy array.
+                - protein_expression (numpy.ndarray): Protein expression values as a 1D numpy array.
+                - protein_emb (torch.Tensor): Pre-trained protein embedding tensor.
+        """
+        # Load the image
+        image_path = self.image_paths[idx]
+        filename = os.path.basename(image_path) 
+        new_filename = os.path.splitext(filename)[0]  + ".tif"
+        new_path = os.path.join("new_he",  new_filename)
         try:
-            v1 = int(spatial_info['row'].iloc[0])
-            v2 = int(spatial_info['col'].iloc[0])
-        except (KeyError, IndexError, ValueError) as e:
-            logging.error(f"Error processing barcode {barcode}: {e}. Skipping.")
-            self.failed_indices.append(idx)
-            return None
-
-        # try:
-        #     image_patch_raw = self.whole_image[(v1 - 128):(v1 + 128), (v2 - 128):(v2 + 128)]
-        # except IndexError as e:
-        #     # logging.error(f"Error extracting image patch for barcode {barcode}: {e}. Likely coordinates are out of bounds. Skipping.")
-        #     self.failed_indices.append(idx)
-        #     return None
-
-        # Define patch boundaries
-        r_start, r_end = v1 - 128, v1 + 128
-        c_start, c_end = v2 - 128, v2 + 128
-
-        # Check boundaries
-        img_h, img_w = self.whole_image.shape[:2]
-        # if r_start < 0 or r_end > img_h or c_start < 0 or c_end > img_w:
-        #      logging.warning(f"Patch boundaries out of image bounds for barcode {barcode}. Image data is None.")
-        #      # items remain None
-        if r_start < 0:
-            r_start, r_end = 0, 256
-        if r_end > img_h:
-            r_start, r_end = img_h - 256, img_h
-        if c_start < 0:
-            c_start, c_end = 0, 256
-        if c_end > img_w:
-            c_start, c_end = img_w - 256, img_w
-
-        image_patch_raw = self.whole_image[r_start:r_end, c_start:c_end]
-        # labels = self.all_labels[r_start:r_end, c_start:c_end]
-
-        if image_patch_raw.shape[0] != 256 or image_patch_raw.shape[1] != 256:
-          # logging.warning(f"image_patch_raw shape is not 256*256. Skipping.")
-          self.failed_indices.append(idx)
-          return None
-
-
-        image_patch = self.transform(image_patch_raw, augment_idx)
-
-        # item['image'] = image_patch
-        # item['input_gene_ids'] = input_gene_ids
-        # item['expressions'] = expressions
-        # item['src_key_padding_mask'] = src_key_padding_mask
-        # item['protein_expression'] = protein_expression
-        # item['protein_emb'] = torch.tensor(self.protein_emb, dtype=torch.float32)
-
-        return image_patch, input_gene_ids, expressions, src_key_padding_mask, input_protein_ids, protein_expressions, src_key_padding_mask_protein, protein_expression, torch.tensor(self.protein_emb, dtype=torch.float32), torch.tensor(self.enrichment[actual_idx], dtype=torch.float32), torch.tensor(actual_idx, dtype=torch.long)
+            image = Image.open(os.path.join('/macroverse-nas/pjz/crc_codex/codex/codex/ORIONCRC_dataset_tile_20x/', image_path)).convert('RGB')  # Ensure images are RGB format
+        except Exception as e:
+            print(f"Warning: failed to open image {new_path}: {e}")
+            return self.__getitem__((idx + 1) % len(self.image_paths))  # 或者 raise 或其他处理方式
+        image = np.array(image)  # Convert to numpy array
     
-    def __len__(self):
-        return len(self.barcode_tsv) * self.augment_factor
+        height, width, channels = image.shape  # (333, 333, 3)
+
+        crop_size = 256
+        start_x = (width - crop_size) // 2  # 水平方向中心点起始位置
+        start_y = (height - crop_size) // 2  # 垂直方向中心点起始位置
+        image_cropped = image[start_y:start_y + crop_size, start_x:start_x + crop_size, :]
+        image_cropped = self.non_augmentations(image_cropped)
+
+        # Apply optional image transformations (if provided)
+        if self.transform:
+            image_cropped = self.transform(image_cropped)
+
+        input_protein_ids = self.input_protein_ids[idx]
+        protein_expressions = self.protein_expressions[idx]
+        src_key_padding_mask_protein = self.src_key_padding_mask_protein[idx]
+
+        # Load the protein expression values for the current Spot
+        protein_expression = self.protein_expression[idx].astype(np.float32)
+
+        # Return image, protein expression, and protein embedding
+        if self.static_features is not None:
+            hist_features = self.static_features["hist_features"][idx].float()
+            hist_celltype_prob = self.static_features["hist_celltype_prob"][idx].float()
+            pred_rna_emb = self.static_features["pred_rna_emb"][idx].float()
+            pred_prot_emb = self.static_features["pred_prot_emb"][idx].float()
+            return (
+                image_cropped,
+                protein_expression,
+                torch.tensor(self.protein_emb, dtype=torch.float32),
+                input_protein_ids,
+                protein_expressions,
+                src_key_padding_mask_protein,
+                hist_features,
+                hist_celltype_prob,
+                pred_rna_emb,
+                pred_prot_emb,
+            )
+        return image_cropped, protein_expression, torch.tensor(self.protein_emb, dtype=torch.float32), input_protein_ids, protein_expressions, src_key_padding_mask_protein
 
     def get_protein_names(self):
         return self.protein_names
