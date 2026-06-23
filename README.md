@@ -45,10 +45,20 @@ ProFlow predicts proteomic expression profiles from bulk transcriptomic data or 
 
 ## Installation
 
+### System Requirements
+
+| Component | Requirement |
+|---|---|
+| Operating System | Ubuntu 22.04.5 LTS |
+| RAM | ≥ 16 GB |
+| CPU | ≥ 4 cores, ≥ 3.3 GHz per core |
+| GPU (Bulk Proteome) | 1× NVIDIA A800-SXM4-80GB |
+| GPU (Spatial Proteome) | ≥ 4× NVIDIA A800-SXM4-80GB |
+
 ### Prerequisites
 
 - Python ≥ 3.10
-- CUDA-compatible GPU (recommended)
+- CUDA-compatible GPU (required)
 - Conda (recommended for environment management)
 
 ### Setup
