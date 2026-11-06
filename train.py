@@ -67,7 +67,7 @@ def parse_args(argv=None):
     training.add_argument(
         '--device',
         default='auto',
-        help='auto selects cuda:7 when CUDA is available, otherwise cpu; or supply cpu/cuda:N',
+        help='auto selects cuda when CUDA is available, otherwise cpu; or supply cpu/cuda:N',
     )
     training.add_argument(
         '--seed',
