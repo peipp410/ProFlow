@@ -9,17 +9,17 @@ def parse_args(argv=None):
     inputs = parser.add_argument_group("Input and output paths")
     inputs.add_argument(
         '--rna-path',
-        default='/home/peijiazheng/proteomics/crc_codex/pretrain/bulk_data/new_data/rna_common_hvg.parquet',
+        default='train_data/rna_common.parquet',
         help='RNA parquet, features by samples',
     )
     inputs.add_argument(
         '--protein-path',
-        default='/home/peijiazheng/proteomics/crc_codex/pretrain/bulk_data/new_data/protein_common.csv.gz',
+        default='train_data/protein_common.csv.gz',
         help='Protein CSV, features by samples',
     )
     inputs.add_argument(
         '--sample-group-path',
-        default='/home/peijiazheng/proteomics/crc_codex/pretrain/bulk_data/new_data/sample_filtered_correct.csv',
+        default='train_data/sample_filtered_correct.csv',
         help='Sample group CSV',
     )
     inputs.add_argument(
@@ -29,7 +29,7 @@ def parse_args(argv=None):
     )
     inputs.add_argument(
         '--scgpt-model-path',
-        default='/home/peijiazheng/agent/server/skills/bulk/ckp/scgpt_model',
+        default='ckp/scgpt_model',
         help='scGPT vocabulary/config directory',
     )
     inputs.add_argument(
@@ -44,12 +44,12 @@ def parse_args(argv=None):
     )
     inputs.add_argument(
         '--rna-checkpoint',
-        default='/mnt/vdd/pjz/rna_state_epoch_5.pt',
+        default='ckp/scgpt_model/rna_state_epoch_5.pt',
         help='Pretrained RNA weights',
     )
     inputs.add_argument(
         '--protein-checkpoint',
-        default='/mnt/vdd/pjz/protein_state_all.pt',
+        default='ckp/scgpt_model/protein_state_all.pt',
         help='Pretrained protein weights',
     )
     inputs.add_argument(

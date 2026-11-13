@@ -770,7 +770,15 @@ def parse_args():
     parser.add_argument("--train-data", required=True, help="Training CSV")
     parser.add_argument("--val-data", required=True, help="Validation CSV")
     parser.add_argument("--checkpoint", required=True, help="Output checkpoint")
-    parser.add_argument("--train-cache", required=True, help="Training static-feature cache")
+    parser.add_argument(
+        "--train-cache",
+        default=None,
+        help=(
+            "Existing training static-feature cache. If omitted or empty, preprocess "
+            "the training data and save a new cache to cache/train_hist_flow_static.pt "
+            "beside --checkpoint."
+        ),
+    )
     parser.add_argument("--val-cache-dir", required=True, help="Validation cache directory")
     parser.add_argument("--scgpt-model-path", required=True)
     parser.add_argument("--protein-embedding-path", required=True)
@@ -791,7 +799,11 @@ def parse_args():
     parser.add_argument("--flow-steps", type=int, default=60)
     parser.add_argument("--learning-rate", type=float, default=0.0015)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--rebuild-static-cache", action="store_true")
+    parser.add_argument(
+        "--rebuild-static-cache",
+        action="store_true",
+        help="Force regeneration of training and validation caches, even when paths are supplied.",
+    )
     args = parser.parse_args()
     positive = {
         "epochs": args.epochs,
@@ -811,6 +823,22 @@ def parse_args():
     return args
 
 
+def resolve_train_cache(args):
+    """Resolve the cache destination and whether preprocessing is required."""
+    if not args.train_cache:
+        cache_path = Path(args.checkpoint).expanduser().parent / "cache" / "train_hist_flow_static.pt"
+        return cache_path, True
+
+    cache_path = Path(args.train_cache).expanduser()
+    if not args.rebuild_static_cache and not cache_path.is_file():
+        raise FileNotFoundError(
+            f"Training cache does not exist: {cache_path}. "
+            "Omit --train-cache to generate it automatically, or use "
+            "--rebuild-static-cache to write a new cache at the supplied path."
+        )
+    return cache_path, args.rebuild_static_cache
+
+
 def set_seed(seed):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -822,6 +850,10 @@ def set_seed(seed):
 
 def main():
     args = parse_args()
+    train_cache_path, rebuild_train_cache = resolve_train_cache(args)
+    accelerator.print(
+        f"{'Generating' if rebuild_train_cache else 'Loading'} training cache: {train_cache_path}"
+    )
     set_seed(args.seed)
     columns = ["new_filenames", *args.protein_columns]
     train_df = pd.read_csv(args.train_data)
@@ -873,10 +905,14 @@ def main():
         "crop_size": args.crop_size,
         "cache_batch_size": args.cache_batch_size,
         "flow_steps": args.flow_steps,
-        "rebuild": args.rebuild_static_cache,
     }
     train_dataset = make_cached_dataset(
-        train_df, args.train_cache, hist_flow_rna, flow_model_prot, **dataset_kwargs
+        train_df,
+        train_cache_path,
+        hist_flow_rna,
+        flow_model_prot,
+        rebuild=rebuild_train_cache,
+        **dataset_kwargs,
     )
     train_loader = DataLoader(
         train_dataset,
@@ -891,7 +927,12 @@ def main():
     for sample_name, sample_df in sample_dfs.items():
         cache_path = Path(args.val_cache_dir) / f"val_{sample_name}_hist_flow_static.pt"
         dataset = make_cached_dataset(
-            sample_df, cache_path, hist_flow_rna, flow_model_prot, **dataset_kwargs
+            sample_df,
+            cache_path,
+            hist_flow_rna,
+            flow_model_prot,
+            rebuild=args.rebuild_static_cache,
+            **dataset_kwargs,
         )
         if list(dataset.get_protein_names()) != list(train_dataset.get_protein_names()):
             raise ValueError(f"Protein order differs for validation sample {sample_name}")
@@ -912,7 +953,10 @@ def main():
         inference_metadata["cache_checks"] = {
             "train": train_dataset.inference_cache_check,
             "validation": {name: ds.inference_cache_check for name, ds in val_dataset.items()},
-            "rebuilt_this_run": args.rebuild_static_cache,
+            "rebuilt_this_run": rebuild_train_cache,
+            "train_cache_path": str(train_cache_path),
+            "train_rebuilt_this_run": rebuild_train_cache,
+            "validation_rebuilt_this_run": args.rebuild_static_cache,
         }
 
     for parameter in hist_flow_rna.parameters():
