@@ -79,7 +79,7 @@ The output CSV is a sample-by-protein prediction matrix. Paths and checkpoint fi
 
 ## Spatial data preparation, training, and prediction
 
-Before spatial training, download the ORION tile data from [Zenodo record 15340874](https://zenodo.org/records/15340874). The archive used by `norm_fig.py` is `ORIONCRC_dataset_tile_20x.zip` (about 127 GB). For example:
+Before spatial training, download the ORION tile data from [Zenodo record 15340874](https://zenodo.org/records/15340874). For example:
 
 ```bash
 mkdir -p data/zenodo
